@@ -1,0 +1,17 @@
+﻿# Logs and state data
+logs/
+profiles/
+*.log
+*.meta
+active_zoom_user.txt
+
+# Temp installer downloads
+ZoomInstallerFull.msi
+CleanZoom.exe
+CleanZoom.zip
+
+# User-specific IDE files / OS metadata
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini
