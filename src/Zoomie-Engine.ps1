@@ -256,6 +256,7 @@ function Invoke-ZoomieEngine {
         }
         $hkuRoot = "Registry::HKEY_USERS\$Sid\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore"
         $loadedHere = $false
+        $initialHiveLoaded = $false
         try {
             $cameraPolicy = $null
             $microphonePolicy = $null
@@ -284,7 +285,9 @@ function Invoke-ZoomieEngine {
             }
 
             & reg.exe query "HKU\$Sid" 2>$null | Out-Null
-            if ($LASTEXITCODE -ne 0) {
+            if ($LASTEXITCODE -eq 0) {
+                $initialHiveLoaded = $true
+            } else {
                 $hivePath = Join-Path $ProfilePath 'NTUSER.DAT'
                 if (-not (Test-Path -LiteralPath $hivePath)) {
                     Write-Step WARN ("Could not grant media consent for {0}: NTUSER.DAT is missing." -f $UserName)
@@ -298,25 +301,53 @@ function Invoke-ZoomieEngine {
                 $loadedHere = $true
             }
 
-            foreach ($device in @('webcam', 'microphone')) {
-                $devicePolicy = if ($device -eq 'webcam') { $cameraPolicy } else { $microphonePolicy }
-                if ($devicePolicy -eq 2) { continue }
-                $userPath = Join-Path $hkuRoot $device
+            function Set-ConsentForDevice {
+                param([string]$Device)
+                $userPath = Join-Path $hkuRoot $Device
                 $userChildPath = Join-Path $userPath 'NonPackaged'
                 try {
                     New-Item -LiteralPath $userPath -Force -ErrorAction Stop | Out-Null
-                    New-ItemProperty -LiteralPath $userPath -Name Value -PropertyType String -Value Allow -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -LiteralPath $userPath -Name Value -PropertyType String `
+                        -Value Allow -Force -ErrorAction Stop | Out-Null
                     New-Item -LiteralPath $userChildPath -Force -ErrorAction Stop | Out-Null
-                    New-ItemProperty -LiteralPath $userChildPath -Name Value -PropertyType String -Value Allow -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -LiteralPath $userChildPath -Name Value -PropertyType String `
+                        -Value Allow -Force -ErrorAction Stop | Out-Null
                     $parentValue = Get-ConsentValue $userPath
                     $childValue = Get-ConsentValue $userChildPath
                     if ($parentValue -eq 'Allow' -and $childValue -eq 'Allow') {
-                        Write-Step INFO ("{0} consent granted for {1} (device and NonPackaged)." -f $device, $UserName)
-                    } else {
-                        Write-Step WARN ("{0} consent could not be verified for {1}." -f $device, $UserName)
+                        Write-Step INFO ("{0} consent granted for {1} (device and NonPackaged)." -f $Device, $UserName)
+                        return $true
                     }
+                    Write-Step WARN ("{0} consent could not be verified for {1}." -f $Device, $UserName)
                 } catch {
-                    Write-Step WARN ("Could not grant {0} consent for {1}: {2}" -f $device, $UserName, $_.Exception.Message)
+                    Write-Step WARN ("Could not grant {0} consent for {1}: {2}" -f $Device, $UserName, $_.Exception.Message)
+                }
+                return $false
+            }
+
+            $retryDevices = @()
+            foreach ($device in @('webcam', 'microphone')) {
+                $devicePolicy = if ($device -eq 'webcam') { $cameraPolicy } else { $microphonePolicy }
+                if ($devicePolicy -eq 2) { continue }
+                if (-not (Set-ConsentForDevice $device)) { $retryDevices += $device }
+            }
+
+            if ($initialHiveLoaded -and $retryDevices.Count) {
+                Write-Step WARN ("Retrying media consent after the profile hive state changed for {0}." -f $UserName)
+                & reg.exe query "HKU\$Sid" 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    $hivePath = Join-Path $ProfilePath 'NTUSER.DAT'
+                    $loadResult = & reg.exe load "HKU\$Sid" $hivePath 2>&1
+                    if ($LASTEXITCODE -eq 0) {
+                        $loadedHere = $true
+                    } else {
+                        Write-Step WARN ("Could not reload profile hive for {0}: {1}" -f $UserName, ($loadResult -join ' ').Trim())
+                    }
+                }
+                if ($loadedHere -or $LASTEXITCODE -eq 0) {
+                    foreach ($device in $retryDevices) {
+                        [void](Set-ConsentForDevice $device)
+                    }
                 }
             }
         } finally {
@@ -558,7 +589,7 @@ function Invoke-ZoomieEngine {
         Invoke-MediaPreflight
         $credential = [pscredential]::new(("{0}\{1}" -f $env:COMPUTERNAME, $activeUser), $securePassword)
         $process = Start-Process -FilePath $zoom -ArgumentList @('--multipt=TRUE', "--data=$profileA") `
-            -WorkingDirectory 'C:\ProgramData' -Credential $credential -PassThru -WindowStyle Normal
+            -WorkingDirectory 'C:\ProgramData' -Credential $credential -LoadUserProfile -PassThru -WindowStyle Normal
         if (-not $process) { throw 'Zoom Start-Process failed.' }
         Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
         Write-Step DONE 'Completed successfully.'
