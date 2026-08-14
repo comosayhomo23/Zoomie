@@ -2,7 +2,7 @@
 param()
 
 Set-StrictMode -Version Latest
-$ErrorActionPreferAence = 'Stop'
+$ErrorActionPreference = 'Stop'
 
 # Robust path detection
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
