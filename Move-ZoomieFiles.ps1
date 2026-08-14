@@ -8,25 +8,20 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
 Set-Location $ScriptDir
 
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host " Organizing Zoomie Repository Files..." -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
+. (Join-Path $ScriptDir 'src\Zoomie.Common.ps1')
+
+Write-Banner -Message 'Organizing Zoomie Repository Files...'
 
 $SrcDir  = Join-Path $ScriptDir "src"
 $AssetDir= Join-Path $ScriptDir "assets"
 $DistDir = Join-Path $ScriptDir "dist"
 
-# Ensure destination directories exist
-foreach ($dir in @($SrcDir, $AssetDir, $DistDir)) {
-    if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    }
-}
+New-ZoomieDirectory -Path @($SrcDir, $AssetDir, $DistDir)
 
 # 1. Move source PowerShell scripts (excluding builder, init, and organizer scripts)
 $psFiles = Get-ChildItem -Path $ScriptDir -Filter "*.ps1" -File
 foreach ($file in $psFiles) {
-    if ($file.Name -notin @('Build-Zoomie.ps1', 'Init-ZoomieRepo.ps1', 'Move-ZoomieFiles.ps1')) {
+    if ($file.Name -notin @('Build-Zoomie.ps1', 'Init-ZoomieRepo.ps1', 'Move-ZoomieFiles.ps1', 'Zoomie.Common.ps1')) {
         $dest = Join-Path $SrcDir $file.Name
         Move-Item -LiteralPath $file.FullName -Destination $dest -Force
         Write-Host "[MOVED] Script -> src\$($file.Name)" -ForegroundColor Green
@@ -51,6 +46,5 @@ foreach ($file in $exeFiles) {
     }
 }
 
-Write-Host "`n====================================================" -ForegroundColor Cyan
-Write-Host " File Organization Complete!" -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host ''
+Write-Banner -Message 'File Organization Complete!'

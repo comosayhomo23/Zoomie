@@ -8,9 +8,9 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
 Set-Location $ScriptDir
 
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host " Initializing Zoomie GitHub Repository Structure..." -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
+. (Join-Path $ScriptDir 'src\Zoomie.Common.ps1')
+
+Write-Banner -Message 'Initializing Zoomie GitHub Repository Structure...'
 
 # 1. Create required directories
 $dirs = @(
@@ -86,6 +86,5 @@ foreach ($filePath in $files.Keys) {
     }
 }
 
-Write-Host "`n====================================================" -ForegroundColor Cyan
-Write-Host " Repository Scaffolding Complete!" -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
+Write-Host ''
+Write-Banner -Message 'Repository Scaffolding Complete!'
