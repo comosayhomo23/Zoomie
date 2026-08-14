@@ -25,7 +25,7 @@ Describe 'Ensure-AdminSandboxAccount' {
     BeforeEach {
         Mock Write-Step {}
         Mock New-LocalUser { [pscustomobject]@{ Name = $Name } }
-        Mock Add-LocalGroupMember -RemoveParameterType Member {}
+        Mock Add-LocalGroupMember -RemoveParameterType Group, Member {}
         # An empty SecureString keeps the analyzer's plaintext-password rule quiet.
         $script:Password = [System.Security.SecureString]::new()
     }
@@ -53,7 +53,7 @@ Describe 'Ensure-AdminSandboxAccount' {
     }
 
     It 'warns instead of throwing when the group membership cannot be granted' {
-        Mock Add-LocalGroupMember -RemoveParameterType Member { throw 'group missing' }
+        Mock Add-LocalGroupMember -RemoveParameterType Group, Member { throw 'group missing' }
         { Ensure-AdminSandboxAccount -UserName 'Zoomie_12345' -Password $script:Password } | Should -Not -Throw
         Should -Invoke Write-Step -ParameterFilter { $Level -eq 'WARN' -and $Message -like '*group missing*' }
     }
