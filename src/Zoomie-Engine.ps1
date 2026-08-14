@@ -220,6 +220,203 @@ function Invoke-ZoomieEngine {
         if ($LASTEXITCODE -eq 0 -and ($sessions -match "(^|\s)$escapedName(\s|$)")) { return $true }
         return $false
     }
+    function Initialize-SandboxProfile {
+        param([string]$UserName, [securestring]$Password)
+        try {
+            $credential = [pscredential]::new(("{0}\{1}" -f $env:COMPUTERNAME, $UserName), $Password)
+            $probe = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" `
+                -ArgumentList '/c exit 0' -Credential $credential -LoadUserProfile -Wait -PassThru `
+                -WindowStyle Hidden
+            if (-not $probe) { throw 'Profile materialization process did not start.' }
+            $record = Get-ProfileRecord $UserName
+            if (-not $record -or -not $record.Path -or -not (Test-Path -LiteralPath (Join-Path $record.Path 'NTUSER.DAT'))) {
+                throw 'Profile materialization did not produce NTUSER.DAT.'
+            }
+            Write-Step INFO ("Materialized profile for {0}: {1}" -f $UserName, $record.Path)
+            return $record
+        } catch {
+            Write-Step WARN ("Could not materialize profile for {0}: {1}" -f $UserName, $_.Exception.Message)
+            return $null
+        }
+    }
+    function Get-ConsentValue {
+        param([string]$Path)
+        try {
+            return (Get-ItemProperty -LiteralPath $Path -Name Value -ErrorAction Stop).Value
+        } catch {
+            return $null
+        }
+    }
+    function Set-SandboxMediaConsent {
+        param([string]$UserName, [string]$Sid, [string]$ProfilePath)
+        $gpoPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'
+        $policy = @{
+            webcam = 'LetAppsAccessCamera'
+            microphone = 'LetAppsAccessMicrophone'
+        }
+        $hkuRoot = "Registry::HKEY_USERS\$Sid\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore"
+        $loadedHere = $false
+        try {
+            $cameraPolicy = $null
+            $microphonePolicy = $null
+            if (Test-Path -LiteralPath $gpoPath) {
+                $cameraGpo = Get-ItemProperty -LiteralPath $gpoPath -Name $policy.webcam `
+                    -ErrorAction SilentlyContinue
+                $microphoneGpo = Get-ItemProperty -LiteralPath $gpoPath -Name $policy.microphone `
+                    -ErrorAction SilentlyContinue
+                if ($cameraGpo) { $cameraPolicy = $cameraGpo.($policy.webcam) }
+                if ($microphoneGpo) { $microphonePolicy = $microphoneGpo.($policy.microphone) }
+            }
+            if ($cameraPolicy -eq 2) {
+                Write-Step WARN 'Camera access is force-denied by Group Policy.'
+            }
+            if ($microphonePolicy -eq 2) {
+                Write-Step WARN 'Microphone access is force-denied by Group Policy.'
+            }
+
+            foreach ($device in @('webcam', 'microphone')) {
+                $machinePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$device"
+                $machineValue = Get-ConsentValue $machinePath
+                $machineChildValue = Get-ConsentValue (Join-Path $machinePath 'NonPackaged')
+                if ($machineValue -eq 'Deny' -or $machineChildValue -eq 'Deny') {
+                    Write-Step WARN ("{0} machine consent floor is Deny; HKLM was not modified." -f $device)
+                }
+            }
+
+            & reg.exe query "HKU\$Sid" 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                $hivePath = Join-Path $ProfilePath 'NTUSER.DAT'
+                if (-not (Test-Path -LiteralPath $hivePath)) {
+                    Write-Step WARN ("Could not grant media consent for {0}: NTUSER.DAT is missing." -f $UserName)
+                    return
+                }
+                $loadResult = & reg.exe load "HKU\$Sid" $hivePath 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Step WARN ("Could not load profile hive for {0}: {1}" -f $UserName, ($loadResult -join ' ').Trim())
+                    return
+                }
+                $loadedHere = $true
+            }
+
+            foreach ($device in @('webcam', 'microphone')) {
+                $devicePolicy = if ($device -eq 'webcam') { $cameraPolicy } else { $microphonePolicy }
+                if ($devicePolicy -eq 2) { continue }
+                $userPath = Join-Path $hkuRoot $device
+                $userChildPath = Join-Path $userPath 'NonPackaged'
+                try {
+                    New-Item -LiteralPath $userPath -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -LiteralPath $userPath -Name Value -PropertyType String -Value Allow -Force -ErrorAction Stop | Out-Null
+                    New-Item -LiteralPath $userChildPath -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -LiteralPath $userChildPath -Name Value -PropertyType String -Value Allow -Force -ErrorAction Stop | Out-Null
+                    $parentValue = Get-ConsentValue $userPath
+                    $childValue = Get-ConsentValue $userChildPath
+                    if ($parentValue -eq 'Allow' -and $childValue -eq 'Allow') {
+                        Write-Step INFO ("{0} consent granted for {1} (device and NonPackaged)." -f $device, $UserName)
+                    } else {
+                        Write-Step WARN ("{0} consent could not be verified for {1}." -f $device, $UserName)
+                    }
+                } catch {
+                    Write-Step WARN ("Could not grant {0} consent for {1}: {2}" -f $device, $UserName, $_.Exception.Message)
+                }
+            }
+        } finally {
+            if ($loadedHere) {
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
+                $unloadResult = & reg.exe unload "HKU\$Sid" 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Step INFO ("Unloaded temporary profile hive for {0}." -f $UserName)
+                } else {
+                    Write-Step WARN ("Could not unload temporary profile hive for {0}: {1}" -f $UserName, ($unloadResult -join ' ').Trim())
+                }
+            }
+        }
+    }
+    function Invoke-MediaPreflight {
+        Write-Step INFO 'Media device preflight:'
+        try {
+            $gpoPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy'
+            $camera = $null
+            $microphone = $null
+            $cameraGpo = Get-ItemProperty -LiteralPath $gpoPath -Name LetAppsAccessCamera `
+                -ErrorAction SilentlyContinue
+            $microphoneGpo = Get-ItemProperty -LiteralPath $gpoPath -Name LetAppsAccessMicrophone `
+                -ErrorAction SilentlyContinue
+            if ($cameraGpo) { $camera = $cameraGpo.LetAppsAccessCamera }
+            if ($microphoneGpo) { $microphone = $microphoneGpo.LetAppsAccessMicrophone }
+            $cameraState = if ($camera -eq 2) { 'ForceDeny' } elseif ($camera -eq 1) { 'ForceAllow' } else { 'UserControl/Unset' }
+            $microphoneState = if ($microphone -eq 2) { 'ForceDeny' } elseif ($microphone -eq 1) { 'ForceAllow' } else { 'UserControl/Unset' }
+            Write-Step INFO ("GPO camera={0}; microphone={1}" -f $cameraState, $microphoneState)
+        } catch {
+            Write-Step WARN ("GPO media policy probe failed: {0}" -f $_.Exception.Message)
+        }
+        try {
+            $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='FrameServer'" -ErrorAction Stop
+            if ($service) {
+                Write-Step INFO ("FrameServer start type: {0}" -f $service.StartMode)
+            } else {
+                Write-Step WARN 'FrameServer service was not found.'
+            }
+        } catch {
+            Write-Step WARN ("FrameServer probe failed: {0}" -f $_.Exception.Message)
+        }
+        try {
+            $category = '{860BB310-5D01-11D0-BD3B-00A0C911CE86}'
+            $roots = @(
+                "HKLM:\SOFTWARE\Classes\CLSID\$category\Instance",
+                "HKLM:\SOFTWARE\WOW6432Node\Classes\CLSID\$category\Instance"
+            )
+            $devices = @()
+            foreach ($root in $roots) {
+                if (Test-Path -LiteralPath $root) {
+                    foreach ($entry in Get-ChildItem -LiteralPath $root -ErrorAction Stop) {
+                        $name = (Get-ItemProperty -LiteralPath $entry.PSPath -Name FriendlyName -ErrorAction SilentlyContinue).FriendlyName
+                        if ($name) { $devices += $name }
+                    }
+                }
+            }
+            $devices = @($devices | Sort-Object -Unique)
+            if ($devices.Count) {
+                foreach ($device in $devices) { Write-Step INFO ("DirectShow camera: {0}" -f $device) }
+            } else {
+                Write-Step WARN 'No DirectShow video-input devices were registered.'
+            }
+        } catch {
+            Write-Step WARN ("DirectShow camera probe failed: {0}" -f $_.Exception.Message)
+        }
+        try {
+            foreach ($flow in @(
+                @{ Label = 'render'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render' },
+                @{ Label = 'capture'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture' }
+            )) {
+                $endpoints = @(Get-ChildItem -LiteralPath $flow.Path -ErrorAction Stop)
+                if (-not $endpoints.Count) {
+                    Write-Step WARN ("Audio {0} endpoints: none registered." -f $flow.Label)
+                    continue
+                }
+                foreach ($endpoint in $endpoints) {
+                    $propertyPath = Join-Path $endpoint.PSPath 'Properties'
+                    $friendlyName = $null
+                    if (Test-Path -LiteralPath $propertyPath) {
+                        $property = Get-ItemProperty -LiteralPath $propertyPath `
+                            -Name '{a45c254e-df1c-4efd-8020-67d146a850e0},14' `
+                            -ErrorAction SilentlyContinue
+                        if ($property) {
+                            $bytes = $property.'{a45c254e-df1c-4efd-8020-67d146a850e0},14'
+                            if ($bytes -is [byte[]] -and $bytes.Length -gt 12) {
+                                $friendlyName = [Text.Encoding]::Unicode.GetString(
+                                    $bytes, 12, $bytes.Length - 12).Trim([char]0)
+                            }
+                        }
+                    }
+                    if (-not $friendlyName) { $friendlyName = $endpoint.PSChildName }
+                    Write-Step INFO ("Audio {0} endpoint: {1}" -f $flow.Label, $friendlyName)
+                }
+            }
+        } catch {
+            Write-Step WARN ("Audio endpoint probe failed: {0}" -f $_.Exception.Message)
+        }
+    }
     function Remove-OrphanSandboxAccounts {
         $currentName = [Environment]::UserName
         foreach ($user in @(Get-LocalUser -ErrorAction SilentlyContinue | Where-Object {
@@ -354,6 +551,11 @@ function Invoke-ZoomieEngine {
         $profileA = Join-Path $profileRoot 'dataA'
         Set-PathAclForUser $profileRoot $activeUser
         Set-PathAclForUser $profileA $activeUser
+        $profileRecord = Initialize-SandboxProfile -UserName $activeUser -Password $securePassword
+        if ($profileRecord) {
+            Set-SandboxMediaConsent -UserName $activeUser -Sid $profileRecord.Sid -ProfilePath $profileRecord.Path
+        }
+        Invoke-MediaPreflight
         $credential = [pscredential]::new(("{0}\{1}" -f $env:COMPUTERNAME, $activeUser), $securePassword)
         $process = Start-Process -FilePath $zoom -ArgumentList @('--multipt=TRUE', "--data=$profileA") `
             -WorkingDirectory 'C:\ProgramData' -Credential $credential -PassThru -WindowStyle Normal
