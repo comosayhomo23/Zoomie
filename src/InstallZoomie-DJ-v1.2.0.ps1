@@ -14,6 +14,8 @@ $script:LogDir     = Join-Path $script:StateDir 'logs'
 $script:ProfilesDir= Join-Path $script:StateDir 'profiles'
 $script:StateFile  = Join-Path $script:StateDir 'active_zoom_user.txt'
 $script:LogFile    = Join-Path $script:LogDir ("engine_dj_{0}.log" -f (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
+$script:SandboxUserPattern = '^Zoomie_\d{5}$'
+$script:TrustedPublisherPattern = 'Zoom Video Communications'
 
 function Write-Step {
     param([string]$Level, [string]$Message)
@@ -84,9 +86,72 @@ function Get-ZoomExePath {
     return $null
 }
 
+function Get-SecureRandomInt {
+    param([Parameter(Mandatory = $true)][int]$MaximumExclusive)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $buffer = [byte[]]::new(4)
+        $limit = [uint32]([math]::Floor([uint32]::MaxValue / $MaximumExclusive) * $MaximumExclusive)
+        do {
+            $rng.GetBytes($buffer)
+            $value = [System.BitConverter]::ToUInt32($buffer, 0)
+        } while ($value -ge $limit)
+        return [int]($value % $MaximumExclusive)
+    } finally { $rng.Dispose() }
+}
+
+function New-SandboxUserName {
+    return "Zoomie_{0}" -f (10000 + (Get-SecureRandomInt -MaximumExclusive 90000))
+}
+
+function New-SandboxPassword {
+    [OutputType([securestring])]
+    param([int]$Length = 24)
+
+    $charSet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$-_='
+    # Index ranges per Windows complexity class: lower, upper, digit, symbol.
+    $classRanges = @(@(0, 25), @(26, 51), @(52, 61), @(62, 68))
+
+    do {
+        $indexes = @(1..$Length | ForEach-Object { Get-SecureRandomInt -MaximumExclusive $charSet.Length })
+        $covered = $true
+        foreach ($range in $classRanges) {
+            if (-not ($indexes | Where-Object { $_ -ge $range[0] -and $_ -le $range[1] })) { $covered = $false }
+        }
+    } while (-not $covered)
+
+    $secure = [System.Security.SecureString]::new()
+    foreach ($index in $indexes) { $secure.AppendChar($charSet[$index]) }
+    $secure.MakeReadOnly()
+    return $secure
+}
+
+function Assert-TrustedPublisher {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw ("Cannot verify missing file: {0}" -f $Path)
+    }
+    $fileHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    Write-Step INFO ("Verifying {0} (SHA-256: {1})" -f (Split-Path $Path -Leaf), $fileHash)
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne 'Valid') {
+        throw ("Authenticode signature for {0} is not valid (status: {1})." -f (Split-Path $Path -Leaf), $signature.Status)
+    }
+    $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { '' }
+    if ($subject -notmatch $script:TrustedPublisherPattern) {
+        throw ("{0} is signed by an untrusted publisher: {1}" -f (Split-Path $Path -Leaf), $subject)
+    }
+    Write-Step OK ("Signature verified for {0}: {1}" -f (Split-Path $Path -Leaf), $subject)
+}
+
 function Remove-AccountAndProfile {
     param([string]$UserName)
-    if (-not $UserName -or $UserName -notmatch '^Zoomie_') { return }
+    if (-not $UserName -or $UserName -notmatch $script:SandboxUserPattern) {
+        if ($UserName) { Write-Step WARN 'Ignoring unrecognized sandbox user name in state file.' }
+        return
+    }
 
     Write-Step INFO ("Cleaning up old sandbox user & profile: {0}" -f $UserName)
     
@@ -124,7 +189,9 @@ function Ensure-PathAclForUser {
     param([string]$Path, [string]$UserName)
     if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
     $qualifiedUser = "{0}\{1}" -f $env:COMPUTERNAME, $UserName
-    & icacls $Path /inheritance:e /grant:r ("{0}:(OI)(CI)M" -f $qualifiedUser) "Administrators:(OI)(CI)F" | Out-Null
+    # /inheritance:r drops inherited ProgramData permissions so other local users cannot read sandbox data.
+    & icacls $Path /inheritance:r /grant:r ("{0}:(OI)(CI)M" -f $qualifiedUser) 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw ("Failed to apply sandbox ACL to {0}" -f $Path) }
     Write-Step INFO ("Granted strict sandbox access to {0}: {1}" -f $qualifiedUser, $Path)
 }
 
@@ -159,15 +226,6 @@ try {
         $MsiMetaFile   = Join-Path $script:StateDir "zoom_msi.meta"
         $CleanMetaFile = Join-Path $script:StateDir "cleanzoom.meta"
 
-        function Test-FileIntegrity {
-            param([Parameter(Mandatory = $true)][string]$Path)
-            if (-not (Test-Path $Path)) { return $false }
-            $fileHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
-            Write-Step INFO "File: $(Split-Path $Path -Leaf)"
-            Write-Step INFO "Computed SHA-256: $fileHash"
-            return $true
-        }
-
         function Test-NeedsUpdate {
             param([string]$Url, [string]$LocalPath, [string]$MetaFile)
             if (-not (Test-Path -LiteralPath $LocalPath)) { return $true }
@@ -197,7 +255,7 @@ try {
         if (Test-NeedsUpdate -Url $MsiUrl -LocalPath $MsiPath -MetaFile $MsiMetaFile) {
             Write-Step INFO "Downloading latest Zoom Workplace 64-bit MSI from official CDN..."
             Invoke-WebRequest -Uri $MsiUrl -OutFile $MsiPath -UseBasicParsing
-            if (-not (Test-FileIntegrity -Path $MsiPath)) { throw "MSI integrity validation failed." }
+            Assert-TrustedPublisher -Path $MsiPath
             
             try {
                 $head = Invoke-WebRequest -Uri $MsiUrl -Method Head -UseBasicParsing
@@ -212,13 +270,19 @@ try {
 
         if (Test-NeedsUpdate -Url $CleanZoomUrl -LocalPath $CleanZoomPath -MetaFile $CleanMetaFile) {
             Write-Step INFO "Downloading latest CleanZoom utility..."
-            $ZipPath = Join-Path $env:TEMP "CleanZoom.zip"
-            Invoke-WebRequest -Uri $CleanZoomUrl -OutFile $ZipPath -UseBasicParsing
-            if (-not (Test-FileIntegrity -Path $ZipPath)) { throw "CleanZoom archive integrity validation failed." }
-            
-            Expand-Archive -Path $ZipPath -DestinationPath $env:TEMP -Force
-            Move-Item -Path "$env:TEMP\CleanZoom.exe" -Destination $CleanZoomPath -Force
-            Remove-Item $ZipPath -ErrorAction SilentlyContinue
+            # Download and extract into a private directory so the payload cannot be swapped before execution.
+            $workDir = Join-Path $env:TEMP ("Zoomie_{0}" -f [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+            try {
+                $ZipPath = Join-Path $workDir 'CleanZoom.zip'
+                Invoke-WebRequest -Uri $CleanZoomUrl -OutFile $ZipPath -UseBasicParsing
+                Expand-Archive -LiteralPath $ZipPath -DestinationPath $workDir -Force
+                $extracted = Join-Path $workDir 'CleanZoom.exe'
+                Assert-TrustedPublisher -Path $extracted
+                Move-Item -LiteralPath $extracted -Destination $CleanZoomPath -Force
+            } finally {
+                Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
 
             try {
                 $head = Invoke-WebRequest -Uri $CleanZoomUrl -Method Head -UseBasicParsing
@@ -232,12 +296,14 @@ try {
         }
 
         Write-Step ACTION "Executing CleanZoom.exe..."
+        Assert-TrustedPublisher -Path $CleanZoomPath
         Start-Process -FilePath $CleanZoomPath -Wait
         
         Write-Step INFO "Waiting 15 seconds for cleanup to settle..."
         Start-Sleep -Seconds 15
         
         Write-Step ACTION "Installing Zoom via MSI..."
+        Assert-TrustedPublisher -Path $MsiPath
         Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i `"$MsiPath`" /quiet /norestart" -Wait
         Write-Step OK "Zoom clean installation finished successfully."
     } else {
@@ -253,12 +319,8 @@ try {
         Remove-AccountAndProfile -UserName $lastUser
     }
 
-    $randNum = Get-Random -Minimum 10000 -Maximum 99999
-    $activeName = "Zoomie_$randNum"
-    
-    $charSet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$-_='
-    $PlainPassword = -join ((1..24) | ForEach-Object { $charSet[(Get-Random -Maximum $charSet.Length)] })
-    $SecurePassword = ConvertTo-SecureString $PlainPassword -AsPlainText -Force
+    $activeName = New-SandboxUserName
+    $SecurePassword = New-SandboxPassword
 
     Write-Step INFO ("Rotation: Spawning new isolated Admin user {0}" -f $activeName)
 
