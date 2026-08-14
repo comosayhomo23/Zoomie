@@ -114,7 +114,7 @@ Describe 'Remove-AccountAndProfile' {
         Mock Get-LocalUser { [pscustomobject]@{ Name = $Name } }
         Mock Remove-LocalUser {}
         Mock Get-CimInstance { $null }
-        Mock Remove-CimInstance {}
+        Mock Remove-CimInstance -RemoveParameterType InputObject {}
         Mock Remove-Item {}
         Mock Test-Path { $false }
     }
@@ -184,7 +184,7 @@ Describe 'Ensure-RestrictedLocalAccount' {
     BeforeEach {
         Mock Write-Step {}
         Mock New-LocalUser { [pscustomobject]@{ Name = $Name } }
-        Mock Add-LocalGroupMember {}
+        Mock Add-LocalGroupMember -RemoveParameterType Member {}
         # An empty SecureString keeps the analyzer's plaintext-password rule quiet.
         $script:Password = [System.Security.SecureString]::new()
     }
@@ -211,7 +211,7 @@ Describe 'Ensure-RestrictedLocalAccount' {
     }
 
     It 'swallows a failure to join the Users group' {
-        Mock Add-LocalGroupMember { throw 'group missing' }
+        Mock Add-LocalGroupMember -RemoveParameterType Member { throw 'group missing' }
         { Ensure-RestrictedLocalAccount -UserName 'Zoomie_12345' -Password $script:Password } | Should -Not -Throw
     }
 

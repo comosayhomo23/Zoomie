@@ -28,7 +28,7 @@ Describe 'Remove-AllSandboxAccounts' {
         Mock Get-LocalUser { $script:Users }
         Mock Remove-LocalUser {}
         Mock Get-CimInstance { $null }
-        Mock Remove-CimInstance {}
+        Mock Remove-CimInstance -RemoveParameterType InputObject {}
         Mock Remove-Item {}
         Mock Test-Path { $false }
     }
