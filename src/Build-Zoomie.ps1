@@ -5,11 +5,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { [AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
-Set-Location -LiteralPath $scriptDir
+$repoDir = if ((Split-Path -Leaf $scriptDir) -ieq 'src') { Split-Path -Parent $scriptDir } else { $scriptDir }
+Set-Location -LiteralPath $repoDir
 
-$srcDir = Join-Path $scriptDir 'src'
-$assetDir = Join-Path $scriptDir 'assets'
-$distDir = Join-Path $scriptDir 'dist'
+$srcDir = Join-Path $repoDir 'src'
+$assetDir = Join-Path $repoDir 'assets'
+$distDir = Join-Path $repoDir 'dist'
 foreach ($directory in @($srcDir, $assetDir, $distDir)) {
     if (-not (Test-Path -LiteralPath $directory)) {
         New-Item -ItemType Directory -LiteralPath $directory -Force | Out-Null
