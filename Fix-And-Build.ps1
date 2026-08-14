@@ -12,6 +12,23 @@ $DistDir   = Join-Path $ScriptDir "dist"
 
 Set-Location $ScriptDir
 
+$script:Failures = [System.Collections.Generic.List[string]]::new()
+
+function Invoke-Ps2ExeBuild {
+    param(
+        [hashtable]$Parameters,
+        [string]$Label
+    )
+    try {
+        Invoke-ps2exe @Parameters
+    } catch {
+        throw ("{0}: ps2exe failed: {1}" -f $Label, $_.Exception.Message)
+    }
+    if (-not (Test-Path -LiteralPath $Parameters.OutputFile)) {
+        throw ("{0}: ps2exe reported no error but {1} was not produced." -f $Label, $Parameters.OutputFile)
+    }
+}
+
 # Ensure output directory exists
 if (-not (Test-Path $DistDir)) {
     New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
@@ -22,11 +39,16 @@ Write-Host " Building Zoomie v1.2.0 Suite..." -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 
 # 1. Verify/Install ps2exe module
-if (-not (Get-Module -ListAvailable ps2exe)) {
-    Write-Host "[INFO] Installing ps2exe module..." -ForegroundColor Yellow
-    Install-Module ps2exe -Scope CurrentUser -Force
+try {
+    if (-not (Get-Module -ListAvailable ps2exe)) {
+        Write-Host "[INFO] Installing ps2exe module..." -ForegroundColor Yellow
+        Install-Module ps2exe -Scope CurrentUser -Force -ErrorAction Stop
+    }
+    Import-Module ps2exe -Force -ErrorAction Stop
+} catch {
+    Write-Host ("[FATAL] ps2exe is unavailable, so nothing can be compiled: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    exit 1
 }
-Import-Module ps2exe -Force
 
 # 2. Check for icon in assets/
 $IconPath = Join-Path $AssetDir "Zoomies.ico"
@@ -56,10 +78,16 @@ if (Test-Path $StandardPs1) {
         version        = "1.2.0.0"
     } + $IconParam
 
-    Invoke-ps2exe @params
-    Write-Host "[OK] Successfully compiled dist\InstallZoomie-v1.2.0.exe" -ForegroundColor Green
+    try {
+        Invoke-Ps2ExeBuild -Parameters $params -Label 'Standard Edition'
+        Write-Host "[OK] Successfully compiled dist\InstallZoomie-v1.2.0.exe" -ForegroundColor Green
+    } catch {
+        [void]$script:Failures.Add($_.Exception.Message)
+        Write-Host ("[ERROR] {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
 } else {
-    Write-Host "[WARN] Source script $StandardPs1 not found in src\. Skipping." -ForegroundColor Yellow
+    [void]$script:Failures.Add("Source script $StandardPs1 not found in src\.")
+    Write-Host "[ERROR] Source script $StandardPs1 not found in src\. Skipping." -ForegroundColor Red
 }
 
 # 4. Build DJ & Webcam Edition
@@ -80,10 +108,16 @@ if (Test-Path $DjPs1) {
         version        = "1.2.0.0"
     } + $IconParam
 
-    Invoke-ps2exe @params
-    Write-Host "[OK] Successfully compiled dist\InstallZoomie-DJ-v1.2.0.exe" -ForegroundColor Green
+    try {
+        Invoke-Ps2ExeBuild -Parameters $params -Label 'DJ Edition'
+        Write-Host "[OK] Successfully compiled dist\InstallZoomie-DJ-v1.2.0.exe" -ForegroundColor Green
+    } catch {
+        [void]$script:Failures.Add($_.Exception.Message)
+        Write-Host ("[ERROR] {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
 } else {
-    Write-Host "[WARN] Source script $DjPs1 not found in src\. Skipping." -ForegroundColor Yellow
+    [void]$script:Failures.Add("Source script $DjPs1 not found in src\.")
+    Write-Host "[ERROR] Source script $DjPs1 not found in src\. Skipping." -ForegroundColor Red
 }
 
 # 5. Build Dedicated Uninstaller
@@ -104,10 +138,24 @@ if (Test-Path $UninstPs1) {
         version        = "1.2.0.0"
     } + $IconParam
 
-    Invoke-ps2exe @uninstParams
-    Write-Host "[OK] Successfully compiled dist\Uninstall-Zoomie.exe" -ForegroundColor Green
+    try {
+        Invoke-Ps2ExeBuild -Parameters $uninstParams -Label 'Uninstaller'
+        Write-Host "[OK] Successfully compiled dist\Uninstall-Zoomie.exe" -ForegroundColor Green
+    } catch {
+        [void]$script:Failures.Add($_.Exception.Message)
+        Write-Host ("[ERROR] {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
 } else {
-    Write-Host "[WARN] Source script $UninstPs1 not found in src\. Skipping Uninstaller build." -ForegroundColor Yellow
+    [void]$script:Failures.Add("Source script $UninstPs1 not found in src\.")
+    Write-Host "[ERROR] Source script $UninstPs1 not found in src\. Skipping Uninstaller build." -ForegroundColor Red
+}
+
+if ($script:Failures.Count -gt 0) {
+    Write-Host "`n====================================================" -ForegroundColor Red
+    Write-Host (" Build FAILED with {0} problem(s):" -f $script:Failures.Count) -ForegroundColor Red
+    foreach ($failure in $script:Failures) { Write-Host (" - {0}" -f $failure) -ForegroundColor Red }
+    Write-Host "====================================================" -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "`n====================================================" -ForegroundColor Cyan

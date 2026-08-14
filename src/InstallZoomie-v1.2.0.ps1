@@ -14,11 +14,31 @@ $script:LogDir     = Join-Path $script:StateDir 'logs'
 $script:ProfilesDir= Join-Path $script:StateDir 'profiles'
 $script:StateFile  = Join-Path $script:StateDir 'active_zoom_user.txt'
 $script:LogFile    = Join-Path $script:LogDir ("engine_{0}.log" -f (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
+$script:ExitCode   = 0
+$script:TranscriptStarted = $false
 
 function Write-Step {
     param([string]$Level, [string]$Message)
     $line = "[{0}] {1}" -f $Level.ToUpperInvariant(), $Message
     Write-Host $line
+}
+
+function Format-ErrorRecord {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $parts = [System.Collections.Generic.List[string]]::new()
+    [void]$parts.Add($ErrorRecord.Exception.Message)
+    $inner = $ErrorRecord.Exception.InnerException
+    while ($inner) {
+        [void]$parts.Add("caused by: {0}" -f $inner.Message)
+        $inner = $inner.InnerException
+    }
+    if ($ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.PositionMessage) {
+        [void]$parts.Add($ErrorRecord.InvocationInfo.PositionMessage.Trim())
+    }
+    if ($ErrorRecord.ScriptStackTrace) {
+        [void]$parts.Add($ErrorRecord.ScriptStackTrace)
+    }
+    return ($parts -join [Environment]::NewLine)
 }
 
 function Test-IsAdmin {
@@ -32,9 +52,13 @@ function Ensure-Elevated {
     $self = $PSCommandPath
     if (-not $self) { throw 'Could not determine script path for elevation.' }
     Write-Step INFO 'Not elevated. Relaunching with Administrator rights...'
-    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ("`"{0}`"" -f $self))
-    if ($LaunchOnly) { $args += '-LaunchOnly' }
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ($args -join ' ')
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ("`"{0}`"" -f $self))
+    if ($LaunchOnly) { $psArgs += '-LaunchOnly' }
+    try {
+        Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList ($psArgs -join ' ') -ErrorAction Stop
+    } catch {
+        throw ("Elevation failed or was declined by the user: {0}" -f $_.Exception.Message)
+    }
     exit 0
 }
 
@@ -48,14 +72,21 @@ function Ensure-Dirs {
 
 function Start-Logging {
     Ensure-Dirs
-    Start-Transcript -Path $script:LogFile -Append | Out-Null
+    try {
+        Start-Transcript -Path $script:LogFile -Append | Out-Null
+        $script:TranscriptStarted = $true
+    } catch {
+        Write-Step WARN ("Could not start transcript at {0}: {1}. Continuing without a log file." -f $script:LogFile, $_.Exception.Message)
+    }
     Write-Step START 'InstallZoomie-v1.2.0.ps1'
     Write-Step INFO ("User={0} Computer={1}" -f $env:USERNAME, $env:COMPUTERNAME)
     Write-Step INFO ("LaunchOnlyMode={0}" -f $LaunchOnly)
 }
 
 function Stop-Logging {
-    try { Stop-Transcript | Out-Null } catch {}
+    if (-not $script:TranscriptStarted) { return }
+    try { Stop-Transcript | Out-Null }
+    catch { Write-Step WARN ("Failed to stop transcript: {0}" -f $_.Exception.Message) }
 }
 
 function Get-ZoomExePath {
@@ -65,7 +96,9 @@ function Get-ZoomExePath {
         try {
             $regValue = (Get-ItemProperty -Path $key -ErrorAction Stop).'(default)'
             if ($regValue) { [void]$candidates.Add($regValue) }
-        } catch {}
+        } catch {
+            Write-Verbose ("No Zoom App Paths entry at {0}: {1}" -f $key, $_.Exception.Message)
+        }
     }
 
     foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
@@ -86,23 +119,32 @@ function Get-ZoomExePath {
 
 function Remove-AccountAndProfile {
     param([string]$UserName)
-    if (-not $UserName -or $UserName -notmatch '^Zoomie_') { return }
+    if (-not $UserName -or $UserName -notmatch '^Zoomie_') { return $true }
 
     Write-Step INFO ("Cleaning up old sandbox user & profile: {0}" -f $UserName)
-    
+    $succeeded = $true
+
     $user = Get-LocalUser -Name $UserName -ErrorAction SilentlyContinue
     if ($user) {
         try { Remove-LocalUser -Name $UserName -ErrorAction Stop; Write-Step OK ("Removed local user {0}" -f $UserName) }
-        catch { Write-Step WARN ("Failed removing user {0}: {1}" -f $UserName, $_.Exception.Message) }
+        catch {
+            $succeeded = $false
+            Write-Step WARN ("Failed removing user {0}: {1}" -f $UserName, $_.Exception.Message)
+        }
     }
 
     $profilePath = Join-Path $env:SystemDrive ("Users\{0}" -f $UserName)
     try {
         $escaped = $profilePath.Replace('\', '\\')
-        $profile = Get-CimInstance Win32_UserProfile -Filter ("LocalPath='{0}'" -f $escaped) -ErrorAction SilentlyContinue
-        if ($profile) { $profile | Remove-CimInstance -ErrorAction Stop; Write-Step OK ("Purged WMI profile for {0}" -f $UserName) }
+        $userProfile = Get-CimInstance Win32_UserProfile -Filter ("LocalPath='{0}'" -f $escaped) -ErrorAction SilentlyContinue
+        if ($userProfile) { $userProfile | Remove-CimInstance -ErrorAction Stop; Write-Step OK ("Purged WMI profile for {0}" -f $UserName) }
         if (Test-Path -LiteralPath $profilePath) { Remove-Item -LiteralPath $profilePath -Recurse -Force -ErrorAction Stop }
-    } catch { Write-Step WARN ("Profile cleanup failed: {0}" -f $_.Exception.Message) }
+    } catch {
+        $succeeded = $false
+        Write-Step WARN ("Profile cleanup failed: {0}" -f $_.Exception.Message)
+    }
+
+    return $succeeded
 }
 
 function Ensure-RestrictedLocalAccount {
@@ -111,17 +153,24 @@ function Ensure-RestrictedLocalAccount {
     # STANDARD EDITION: Creates a Least-Privilege Standard User (Users group)
     New-LocalUser -Name $UserName -Password $Password -FullName "Zoom Sandbox" -Description 'Restricted ephemeral Zoom instance' -PasswordNeverExpires -AccountNeverExpires | Out-Null
     Write-Step OK ("Created standard local user {0} (Least Privilege)" -f $UserName)
-    
+
     try {
         Add-LocalGroupMember -Group 'Users' -Member $UserName -ErrorAction Stop
-    } catch {}
+    } catch [Microsoft.PowerShell.Commands.MemberExistsException] {
+        Write-Step INFO ("{0} is already a member of Users." -f $UserName)
+    } catch {
+        throw ("Failed adding {0} to the Users group, so the sandbox account cannot log on: {1}" -f $UserName, $_.Exception.Message)
+    }
 }
 
 function Ensure-PathAclForUser {
     param([string]$Path, [string]$UserName)
     if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
     $qualifiedUser = "{0}\{1}" -f $env:COMPUTERNAME, $UserName
-    & icacls $Path /inheritance:e /grant:r ("{0}:(OI)(CI)M" -f $qualifiedUser) "Administrators:(OI)(CI)F" | Out-Null
+    $icaclsOutput = & { $ErrorActionPreference = 'Continue'; & icacls $Path /inheritance:e /grant:r ("{0}:(OI)(CI)M" -f $qualifiedUser) "Administrators:(OI)(CI)F" 2>&1 }
+    if ($LASTEXITCODE -ne 0) {
+        throw ("icacls failed (exit {0}) while restricting {1} to {2}: {3}" -f $LASTEXITCODE, $Path, $qualifiedUser, ($icaclsOutput -join ' '))
+    }
     Write-Step INFO ("Granted strict sandbox access to {0}: {1}" -f $qualifiedUser, $Path)
 }
 
@@ -138,7 +187,9 @@ function Ensure-DesktopShortcut {
         $shortcut.WindowStyle = 1
         $shortcut.Save()
         Write-Step OK "Created desktop shortcut: Zoomie.lnk"
-    } catch { Write-Step WARN "Failed to create shortcut" }
+    } catch {
+        Write-Step WARN ("Failed to create shortcut {0}: {1}" -f $linkPath, $_.Exception.Message)
+    }
 }
 # ----------------- MAIN EXECUTION -----------------
 try {
@@ -157,12 +208,53 @@ try {
         $CleanMetaFile = Join-Path $script:StateDir "cleanzoom.meta"
 
         function Test-FileIntegrity {
-            param([Parameter(Mandatory = $true)][string]$Path)
-            if (-not (Test-Path $Path)) { return $false }
-            $fileHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+            param(
+                [Parameter(Mandatory = $true)][string]$Path,
+                [string]$ExpectedHash
+            )
+            if (-not (Test-Path -LiteralPath $Path)) {
+                Write-Step WARN "Expected download is missing: $Path"
+                return $false
+            }
+            if ((Get-Item -LiteralPath $Path).Length -eq 0) {
+                Write-Step WARN "Download is empty (0 bytes): $Path"
+                return $false
+            }
+            $fileHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
             Write-Step INFO "File: $(Split-Path $Path -Leaf)"
             Write-Step INFO "Computed SHA-256: $fileHash"
+            if ($ExpectedHash) {
+                if ($fileHash -ne $ExpectedHash.Trim().ToUpperInvariant()) {
+                    Write-Step WARN "SHA-256 mismatch. Expected: $ExpectedHash"
+                    return $false
+                }
+                Write-Step OK "SHA-256 matches the expected value."
+            } else {
+                Write-Step INFO "No expected SHA-256 supplied; hash recorded for auditing only."
+            }
             return $true
+        }
+
+        function Invoke-Download {
+            param([string]$Url, [string]$OutFile)
+            try {
+                Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+            } catch {
+                if (Test-Path -LiteralPath $OutFile) { Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue }
+                throw ("Download failed for {0}: {1}" -f $Url, $_.Exception.Message)
+            }
+        }
+
+        function Save-RemoteMetadataStamp {
+            param([string]$Url, [string]$MetaFile)
+            try {
+                $head = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -ErrorAction Stop
+                if ($head.Headers['Last-Modified']) {
+                    Set-Content -LiteralPath $MetaFile -Value $head.Headers['Last-Modified'] -Force
+                }
+            } catch {
+                Write-Step WARN ("Could not record CDN metadata in {0}: {1}. The file will be re-downloaded next run." -f $MetaFile, $_.Exception.Message)
+            }
         }
 
         function Test-NeedsUpdate {
@@ -183,7 +275,7 @@ try {
                     return $true
                 }
             } catch {
-                Write-Step WARN "Could not check CDN headers for updates. Using local file."
+                Write-Step WARN ("Could not check CDN headers for updates ({0}). Using local file." -f $_.Exception.Message)
             }
             return $false
         }
@@ -194,15 +286,10 @@ try {
         # 1. Check and download Zoom 64-bit MSI if missing or updated
         if (Test-NeedsUpdate -Url $MsiUrl -LocalPath $MsiPath -MetaFile $MsiMetaFile) {
             Write-Step INFO "Downloading latest Zoom Workplace 64-bit MSI from official CDN..."
-            Invoke-WebRequest -Uri $MsiUrl -OutFile $MsiPath -UseBasicParsing
+            Invoke-Download -Url $MsiUrl -OutFile $MsiPath
             if (-not (Test-FileIntegrity -Path $MsiPath)) { throw "MSI integrity validation failed." }
-            
-            try {
-                $head = Invoke-WebRequest -Uri $MsiUrl -Method Head -UseBasicParsing
-                if ($head.Headers['Last-Modified']) {
-                    Set-Content -LiteralPath $MsiMetaFile -Value $head.Headers['Last-Modified'] -Force
-                }
-            } catch {}
+
+            Save-RemoteMetadataStamp -Url $MsiUrl -MetaFile $MsiMetaFile
             Write-Step OK "Zoom 64-bit MSI updated and verified."
         } else {
             Write-Step INFO "Zoom 64-bit MSI is up to date."
@@ -212,19 +299,22 @@ try {
         if (Test-NeedsUpdate -Url $CleanZoomUrl -LocalPath $CleanZoomPath -MetaFile $CleanMetaFile) {
             Write-Step INFO "Downloading latest CleanZoom utility..."
             $ZipPath = Join-Path $env:TEMP "CleanZoom.zip"
-            Invoke-WebRequest -Uri $CleanZoomUrl -OutFile $ZipPath -UseBasicParsing
+            Invoke-Download -Url $CleanZoomUrl -OutFile $ZipPath
             if (-not (Test-FileIntegrity -Path $ZipPath)) { throw "CleanZoom archive integrity validation failed." }
-            
-            Expand-Archive -Path $ZipPath -DestinationPath $env:TEMP -Force
-            Move-Item -Path "$env:TEMP\CleanZoom.exe" -Destination $CleanZoomPath -Force
-            Remove-Item $ZipPath -ErrorAction SilentlyContinue
 
+            $extractedExe = Join-Path $env:TEMP 'CleanZoom.exe'
             try {
-                $head = Invoke-WebRequest -Uri $CleanZoomUrl -Method Head -UseBasicParsing
-                if ($head.Headers['Last-Modified']) {
-                    Set-Content -LiteralPath $CleanMetaFile -Value $head.Headers['Last-Modified'] -Force
-                }
-            } catch {}
+                Expand-Archive -LiteralPath $ZipPath -DestinationPath $env:TEMP -Force -ErrorAction Stop
+            } catch {
+                throw ("Could not extract {0}: {1}" -f $ZipPath, $_.Exception.Message)
+            }
+            if (-not (Test-Path -LiteralPath $extractedExe)) {
+                throw ("CleanZoom.exe was not found in the downloaded archive {0}." -f $ZipPath)
+            }
+            Move-Item -LiteralPath $extractedExe -Destination $CleanZoomPath -Force
+            Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue
+
+            Save-RemoteMetadataStamp -Url $CleanZoomUrl -MetaFile $CleanMetaFile
             Write-Step OK "CleanZoom updated and verified."
         } else {
             Write-Step INFO "CleanZoom utility is up to date."
@@ -232,13 +322,24 @@ try {
 
         # Execute Cleanup & Installation
         Write-Step ACTION "Executing CleanZoom.exe..."
-        Start-Process -FilePath $CleanZoomPath -Wait
-        
+        $clean = Start-Process -FilePath $CleanZoomPath -Wait -PassThru
+        if (-not $clean) { throw 'Failed to start CleanZoom.exe.' }
+        if ($clean.ExitCode -ne 0) {
+            Write-Step WARN ("CleanZoom exited with code {0}; continuing with the installation." -f $clean.ExitCode)
+        }
+
         Write-Step INFO "Waiting 15 seconds for cleanup to settle..."
         Start-Sleep -Seconds 15
-        
+
         Write-Step ACTION "Installing Zoom via MSI..."
-        Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i `"$MsiPath`" /quiet /norestart" -Wait
+        $msi = Start-Process -FilePath 'msiexec.exe' -ArgumentList "/i `"$MsiPath`" /quiet /norestart" -Wait -PassThru
+        if (-not $msi) { throw 'Failed to start msiexec.exe.' }
+        if ($msi.ExitCode -notin @(0, 1641, 3010)) {
+            throw ("Zoom MSI installation failed with msiexec exit code {0}." -f $msi.ExitCode)
+        }
+        if ($msi.ExitCode -in @(1641, 3010)) {
+            Write-Step WARN ("Zoom installed but requested a reboot (msiexec exit code {0})." -f $msi.ExitCode)
+        }
         Write-Step OK "Zoom clean installation finished successfully."
     } else {
         Write-Step INFO "LaunchOnly mode active. Skipping installation sequence."
@@ -251,7 +352,9 @@ try {
     # 1. Clean up the previous temporary user (if exists)
     if (Test-Path -LiteralPath $script:StateFile) {
         $lastUser = (Get-Content -LiteralPath $script:StateFile -Raw).Trim()
-        Remove-AccountAndProfile -UserName $lastUser
+        if (-not (Remove-AccountAndProfile -UserName $lastUser)) {
+            Write-Step WARN ("Sandbox user {0} could not be fully removed and is now orphaned. Run Uninstall-Zoomie to purge leftovers." -f $lastUser)
+        }
     }
 
     # 2. Generate new Randomized User and secure password
@@ -280,7 +383,11 @@ try {
     $cred = [pscredential]::new($qualifiedUser, $SecurePassword)
 
     Write-Step ACTION ("Starting Zoom instance as restricted user: {0}" -f $qualifiedUser)
-    $p1 = Start-Process -FilePath $zoom -ArgumentList $zoomArgs1 -WorkingDirectory 'C:\ProgramData' -Credential $cred -PassThru -WindowStyle Normal
+    try {
+        $p1 = Start-Process -FilePath $zoom -ArgumentList $zoomArgs1 -WorkingDirectory 'C:\ProgramData' -Credential $cred -PassThru -WindowStyle Normal -ErrorAction Stop
+    } catch {
+        throw ("Could not start Zoom as {0}: {1}" -f $qualifiedUser, $_.Exception.Message)
+    }
     if (-not $p1) { throw 'Zoom Start-Process failed.' }
     Write-Step OK ("Zoom instance PID={0}" -f $p1.Id)
 
@@ -291,13 +398,23 @@ try {
     Write-Step DONE 'Completed successfully.'
 }
 catch {
-    Write-Step FATAL $_.Exception.Message
+    $script:ExitCode = 1
+    Write-Step FATAL (Format-ErrorRecord $_)
     Write-Step FATAL ("See log: {0}" -f $script:LogFile)
 }
 finally {
     Stop-Logging
     Write-Host "`n====================================================" -ForegroundColor Cyan
-    Write-Host "Process finished. Press any key to close this window..." -ForegroundColor Green
+    if ($script:ExitCode -eq 0) {
+        Write-Host "Process finished. Press any key to close this window..." -ForegroundColor Green
+    } else {
+        Write-Host "Process FAILED (exit code $script:ExitCode). Press any key to close this window..." -ForegroundColor Red
+    }
     Write-Host "====================================================" -ForegroundColor Cyan
-    $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    try {
+        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    } catch {
+        Write-Host "(Non-interactive host; skipping keypress.)" -ForegroundColor DarkGray
+    }
+    exit $script:ExitCode
 }
