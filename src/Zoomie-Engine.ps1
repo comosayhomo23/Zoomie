@@ -1,3 +1,43 @@
+function Get-CryptoRandomInt32 {
+    param([Parameter(Mandatory)][int]$ExclusiveMaximum)
+    if ($ExclusiveMaximum -le 0) { throw 'Exclusive maximum must be positive.' }
+    $provider = [Security.Cryptography.RNGCryptoServiceProvider]::new()
+    try {
+        $bytes = [byte[]]::new(4)
+        $range = [uint64]1 -shl 32
+        $limit = $range - ($range % [uint64]$ExclusiveMaximum)
+        do {
+            $provider.GetBytes($bytes)
+            $value = [uint64][BitConverter]::ToUInt32($bytes, 0)
+        } while ($value -ge $limit)
+        return [int]($value % [uint64]$ExclusiveMaximum)
+    } finally {
+        $provider.Dispose()
+    }
+}
+
+function Get-RandomSecurePassword {
+    $classes = @(
+        'ABCDEFGHJKLMNPQRSTUVWXYZ',
+        'abcdefghijkmnopqrstuvwxyz',
+        '23456789',
+        '!@#%^*_+=.'
+    )
+    $password = [Security.SecureString]::new()
+    foreach ($class in $classes) {
+        $password.AppendChar($class[(Get-CryptoRandomInt32 $class.Length)])
+    }
+    $alphabet = $classes -join ''
+    while ($password.Length -lt 24) {
+        $password.AppendChar($alphabet[(Get-CryptoRandomInt32 $alphabet.Length)])
+    }
+    return $password
+}
+
+function Get-RandomSandboxName {
+    return "Zoomie_{0:D5}" -f ((Get-CryptoRandomInt32 90000) + 10000)
+}
+
 function Invoke-ZoomieEngine {
     [CmdletBinding()]
     param(
@@ -169,40 +209,46 @@ function Invoke-ZoomieEngine {
             Write-Step OK ("Removed sandbox data {0}" -f $sandboxPath)
         }
     }
+    function Test-SandboxUserLive {
+        param([string]$UserName)
+        $escapedName = [regex]::Escape($UserName)
+        $processes = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object {
+            $_.UserName -match "\\$escapedName$"
+        })
+        if ($processes.Count -gt 0) { return $true }
+        $sessions = & quser.exe 2>$null
+        if ($LASTEXITCODE -eq 0 -and ($sessions -match "(^|\s)$escapedName(\s|$)")) { return $true }
+        return $false
+    }
     function Remove-OrphanSandboxAccounts {
         $currentName = [Environment]::UserName
         foreach ($user in @(Get-LocalUser -ErrorAction SilentlyContinue | Where-Object {
             $_.Name -match $sandboxPattern -and $_.Name -ne $currentName
         })) {
-            Remove-AccountAndProfile $user.Name
+            if (Test-SandboxUserLive -UserName $user.Name) {
+                Write-Step WARN ("Leaving live sandbox user in place: {0}" -f $user.Name)
+                continue
+            }
+            try {
+                Remove-AccountAndProfile $user.Name
+            } catch {
+                Write-Step WARN ("Failed cleaning sandbox user {0}: {1}" -f $user.Name, $_.Exception.Message)
+            }
         }
     }
     function New-SandboxAccount {
         param([string]$UserName, [securestring]$Password)
         New-LocalUser -Name $UserName -Password $Password -FullName $config.FullName `
             -Description $config.Description -PasswordNeverExpires -AccountNeverExpires | Out-Null
-        Add-LocalGroupMember -Group $config.Group -Member $UserName -ErrorAction Stop
+        $qualifiedName = "{0}\{1}" -f $env:COMPUTERNAME, $UserName
+        try {
+            Add-LocalGroupMember -Group $config.Group -Member $UserName -ErrorAction Stop
+        } catch {
+            $member = Get-LocalGroupMember -Group $config.Group -ErrorAction Stop |
+                Where-Object { $_.Name -eq $qualifiedName -or $_.SID.Value -eq (Get-LocalUser -Name $UserName).SID.Value }
+            if (-not $member) { throw }
+        }
         Write-Step OK ("Created {0} sandbox user {1}" -f $Edition, $UserName)
-    }
-    function Get-RandomSecurePassword {
-        $classes = @(
-            'ABCDEFGHJKLMNPQRSTUVWXYZ',
-            'abcdefghijkmnopqrstuvwxyz',
-            '23456789',
-            '!@#%^*_+=.'
-        )
-        $password = [Security.SecureString]::new()
-        foreach ($class in $classes) {
-            $password.AppendChar($class[[Security.Cryptography.RandomNumberGenerator]::GetInt32($class.Length)])
-        }
-        $alphabet = $classes -join ''
-        while ($password.Length -lt 24) {
-            $password.AppendChar($alphabet[[Security.Cryptography.RandomNumberGenerator]::GetInt32($alphabet.Length)])
-        }
-        return $password
-    }
-    function Get-RandomSandboxName {
-        return "Zoomie_{0:D5}" -f [Security.Cryptography.RandomNumberGenerator]::GetInt32(10000, 100000)
     }
     function Get-TrustedPublisherCn {
         param($Certificate)
@@ -292,8 +338,7 @@ function Invoke-ZoomieEngine {
                 Remove-Item -LiteralPath $zipPath -Force
                 Set-DownloadMetadata $cleanUrl $cleanMeta
             }
-            $cleanHash = Assert-TrustedInstaller $cleanPath $allowedCn
-            Assert-HashUnchanged $cleanPath $cleanHash
+            Assert-TrustedInstaller $cleanPath $allowedCn | Out-Null
             Start-Process -FilePath $cleanPath -Wait
             Start-Sleep -Seconds 15
             Assert-HashUnchanged $msiPath $msiHash
