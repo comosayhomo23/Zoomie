@@ -4,90 +4,73 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Robust path detection
-$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { [System.AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
-Set-Location $ScriptDir
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { [AppDomain]::CurrentDomain.BaseDirectory.TrimEnd('\') }
+$repoDir = if ((Split-Path -Leaf $scriptDir) -ieq 'src') { Split-Path -Parent $scriptDir } else { $scriptDir }
+Set-Location -LiteralPath $repoDir
 
-$SrcDir  = Join-Path $ScriptDir "src"
-$AssetDir= Join-Path $ScriptDir "assets"
-$DistDir = Join-Path $ScriptDir "dist"
-
-# Ensure output directories exist
-foreach ($dir in @($SrcDir, $AssetDir, $DistDir)) {
-    if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$srcDir = Join-Path $repoDir 'src'
+$assetDir = Join-Path $repoDir 'assets'
+$distDir = Join-Path $repoDir 'dist'
+foreach ($directory in @($srcDir, $assetDir, $distDir)) {
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -LiteralPath $directory -Force | Out-Null
     }
 }
 
-Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host " Building Zoomie v1.2.0..." -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
-
-# 1. Verify/Install ps2exe module
-if (-not (Get-Module -ListAvailable ps2exe)) {
-    Write-Host "[INFO] Installing ps2exe module..." -ForegroundColor Yellow
+if (-not (Get-Module -ListAvailable -Name ps2exe)) {
     Install-Module ps2exe -Scope CurrentUser -Force
 }
 Import-Module ps2exe -Force
 
-# 2. Check for icon in assets/
-$IconPath = Join-Path $AssetDir "Zoomies.ico"
-$IconParam = @{}
-if (Test-Path $IconPath) {
-    $IconParam = @{ IconFile = $IconPath }
-    Write-Host "[OK] Found custom icon: assets\Zoomies.ico" -ForegroundColor Green
-} else {
-    Write-Host "[WARN] Icon file not found at $IconPath. Compiling without custom icon." -ForegroundColor Yellow
+$enginePath = Join-Path $srcDir 'Zoomie-Engine.ps1'
+$iconPath = Join-Path $assetDir 'Zoomies.ico'
+$iconParameters = @{}
+if (Test-Path -LiteralPath $iconPath) {
+    $iconParameters = @{ IconFile = $iconPath }
 }
 
-# 3. Build Standard Edition
-$StandardPs1 = Join-Path $SrcDir "InstallZoomie-v1.2.0.ps1"
-$StandardExe = Join-Path $DistDir "InstallZoomie-v1.2.0.exe"
-
-if (Test-Path $StandardPs1) {
-    Write-Host "`n[BUILDING] Standard Edition -> dist\" -ForegroundColor Green
-    Remove-Item -LiteralPath $StandardExe -Force -ErrorAction SilentlyContinue
-    
-    $params = @{
-        InputFile      = $StandardPs1
-        OutputFile     = $StandardExe
-        RequireAdmin   = $true
-        Title          = "Zoomie Standard Edition"
-        Company        = "ComoLabs"
-        Product        = "Zoomie"
-        version        = "1.2.0.0"
-    } + $IconParam
-
-    Invoke-ps2exe @params
-    Write-Host "[OK] Successfully compiled dist\InstallZoomie-v1.2.0.exe" -ForegroundColor Green
-} else {
-    Write-Host "[WARN] Source script $StandardPs1 not found. Skipping." -ForegroundColor Yellow
+function Set-CompiledInput {
+    param(
+        [Parameter(Mandatory)][string]$Edition,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+    $header = "[CmdletBinding()]`r`nparam([switch]`$LaunchOnly)`r`n"
+    $engine = Get-Content -LiteralPath $enginePath -Raw
+    $entry = "`r`nInvoke-ZoomieEngine -Edition '$Edition' -LaunchOnly:`$LaunchOnly`r`n"
+    Set-Content -LiteralPath $OutputPath -Value ($header + $engine + $entry) -Encoding utf8
 }
 
-# 4. Build DJ & Webcam Edition
-$DjPs1 = Join-Path $SrcDir "InstallZoomie-DJ-v1.2.0.ps1"
-$DjExe = Join-Path $DistDir "InstallZoomie-DJ-v1.2.0.exe"
-
-if (Test-Path $DjPs1) {
-    Write-Host "`n[BUILDING] DJ Edition -> dist\" -ForegroundColor Green
-    Remove-Item -LiteralPath $DjExe -Force -ErrorAction SilentlyContinue
-    
-    $params = @{
-        InputFile      = $DjPs1
-        OutputFile     = $DjExe
-        RequireAdmin   = $true
-        Title          = "Zoomie DJ/Webcam Edition"
-        Company        = "ComoLabs"
-        Product        = "Zoomie DJ"
-        version        = "1.2.0.0"
-    } + $IconParam
-
-    Invoke-ps2exe @params
-    Write-Host "[OK] Successfully compiled dist\InstallZoomie-DJ-v1.2.0.exe" -ForegroundColor Green
-} else {
-    Write-Host "[WARN] Source script $DjPs1 not found. Skipping." -ForegroundColor Yellow
+function Invoke-EditionBuild {
+    param(
+        [Parameter(Mandatory)][string]$Edition,
+        [Parameter(Mandatory)][string]$OutputName,
+        [Parameter(Mandatory)][hashtable]$Metadata
+    )
+    $outputPath = Join-Path $distDir $OutputName
+    $temporaryPath = Join-Path $env:TEMP ("Zoomie-{0}.ps1" -f $Edition)
+    try {
+        Set-CompiledInput -Edition $Edition -OutputPath $temporaryPath
+        Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue
+        $parameters = @{
+            InputFile = $temporaryPath
+            OutputFile = $outputPath
+            RequireAdmin = $true
+            Title = $Metadata.Title
+            Company = 'ComoLabs'
+            Product = $Metadata.Product
+            Version = '1.2.0.0'
+        } + $iconParameters
+        Invoke-ps2exe @parameters
+    } finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
-Write-Host "`n====================================================" -ForegroundColor Cyan
-Write-Host " Build Complete! Binaries correctly placed in /dist" -ForegroundColor Cyan
-Write-Host "====================================================" -ForegroundColor Cyan
+Invoke-EditionBuild -Edition Standard -OutputName 'InstallZoomie-v1.2.0.exe' -Metadata @{
+    Title = 'Zoomie Standard Edition'
+    Product = 'Zoomie'
+}
+Invoke-EditionBuild -Edition DJ -OutputName 'InstallZoomie-DJ-v1.2.0.exe' -Metadata @{
+    Title = 'Zoomie DJ/Webcam Edition'
+    Product = 'Zoomie DJ'
+}
